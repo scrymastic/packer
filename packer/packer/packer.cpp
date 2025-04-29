@@ -2,13 +2,13 @@
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
+#include <climits>
 #include <iostream>
 #include <fstream>
 #include <string>
 #include <vector>
 #include <windows.h>
-#include <zlib.h>
-
+#include <compressapi.h>
 
 std::vector<std::uint8_t> read_file(const std::string& filename) {
     std::ifstream fp(filename, std::ios::binary);
@@ -53,27 +53,6 @@ void validate_target(const std::vector<std::uint8_t>& target) {
     }
 }
 
-std::vector<std::uint8_t> load_resource(LPCSTR name, LPCSTR type) {
-    auto resource = FindResourceA(nullptr, name, type);
-
-    if (resource == nullptr) {
-        std::cerr << "Error: couldn't find resource." << std::endl;
-        ExitProcess(6);
-    }
-
-    auto rsrc_size = SizeofResource(GetModuleHandleA(nullptr), resource);
-    auto handle = LoadResource(nullptr, resource);
-
-    if (handle == nullptr) {
-        std::cerr << "Error: couldn't load resource." << std::endl;
-        ExitProcess(7);
-    }
-
-    auto byte_buffer = reinterpret_cast<std::uint8_t*>(LockResource(handle));
-
-    return std::vector<std::uint8_t>(&byte_buffer[0], &byte_buffer[rsrc_size]);
-}
-
 template <typename T>
 T align(T value, T alignment) {
     auto result = value + ((value % alignment == 0) ? 0 : alignment - (value % alignment));
@@ -81,16 +60,30 @@ T align(T value, T alignment) {
 }
 
 std::vector<std::uint8_t> compress_data(const std::uint8_t* data, std::size_t size) {
-    uLong max_size = compressBound(size);
-    std::vector<std::uint8_t> compressed(max_size);
-    uLong real_size = max_size;
-
-    if (compress(compressed.data(), &real_size, data, size) != Z_OK) {
-        std::cerr << "Error: zlib failed to compress the buffer." << std::endl;
+    COMPRESSOR_HANDLE compressor = nullptr;
+    if (!CreateCompressor(COMPRESS_ALGORITHM_MSZIP, nullptr, &compressor)) {
+        std::cerr << "Error: couldn't create compressor." << std::endl;
         ExitProcess(8);
     }
 
-    compressed.resize(real_size);
+    SIZE_T compressed_size = 0;
+    if (!Compress(compressor, data, size, nullptr, 0, &compressed_size)) {
+        if (GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
+            std::cerr << "Error: couldn't calculate compressed size." << std::endl;
+            CloseCompressor(compressor);
+            ExitProcess(8);
+        }
+    }
+
+    std::vector<std::uint8_t> compressed(compressed_size);
+    if (!Compress(compressor, data, size, compressed.data(), compressed.size(), &compressed_size)) {
+        std::cerr << "Error: compression failed." << std::endl;
+        CloseCompressor(compressor);
+        ExitProcess(8);
+    }
+
+    CloseCompressor(compressor);
+    compressed.resize(compressed_size);
     return compressed;
 }
 
@@ -110,7 +103,7 @@ int main(int argc, char* argv[]) {
     // Extract PE headers and sections
     auto dos_header = reinterpret_cast<const IMAGE_DOS_HEADER*>(target.data());
     auto nt_header = reinterpret_cast<const IMAGE_NT_HEADERS64*>(target.data() + dos_header->e_lfanew);
-    
+
     // Find the first section header
     auto section_table = reinterpret_cast<const IMAGE_SECTION_HEADER*>(
         reinterpret_cast<const std::uint8_t*>(&nt_header->OptionalHeader) + 
@@ -120,8 +113,13 @@ int main(int argc, char* argv[]) {
     // Find the start of the first section in the file - this is where headers end
     auto first_section_offset = section_table[0].PointerToRawData;
     
-    // Split headers and sections
-    std::vector<std::uint8_t> headers(target.data(), target.data() + first_section_offset);
+    // Split headers (only NT headers) and sections
+    // Calculate NT headers size (including section table)
+    auto nt_headers_size = sizeof(IMAGE_NT_HEADERS64) + (nt_header->FileHeader.NumberOfSections * sizeof(IMAGE_SECTION_HEADER));
+    std::vector<std::uint8_t> headers(
+        target.data() + dos_header->e_lfanew,  // Start from NT headers
+        target.data() + dos_header->e_lfanew + nt_headers_size  // Include NT headers and section table
+    );
     std::vector<std::uint8_t> sections(target.data() + first_section_offset, target.data() + target.size());
     
     // Compress headers and sections separately
