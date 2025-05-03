@@ -1,452 +1,796 @@
 #include <cstring>
 #include <cstddef>
 #include <cstdint>
-#include <climits>
 #include <iostream>
 #include <fstream>
 #include <vector>
-#include <limits>
 #include <windows.h>
 #include <compressapi.h>
+#pragma comment(lib, "Cabinet.lib")
+#include "../../packer/packer/pe.hpp"
+#include <intrin.h>
+#include <tlhelp32.h>
 
-// System constants
-constexpr size_t PAGE_SIZE = 0x1000;  // Standard x64 page size
+// Error codes
+#define STUB_ERROR_FILE_NOT_FOUND 1
+#define STUB_ERROR_DECOMPRESS_FAILED 2
+#define STUB_ERROR_ALLOC_FAILED 3
+#define STUB_ERROR_LOAD_DLL_FAILED 4
+#define STUB_ERROR_GET_PROC_ADDRESS_FAILED 5
+#define STUB_ERROR_GET_PROC_ADDRESS_BY_NAME_FAILED 6
+#define STUB_ERROR_RELOCATION_FAILED 7
+#define STUB_ERROR_NO_RELOCATION_DIRECTORY 8
+#define STUB_ERROR_INVALID_IMAGE 9
 
-const IMAGE_NT_HEADERS64* get_nt_headers(const std::uint8_t* image) {
-    // Since we only stored NT headers, the image pointer points directly to them
-    return reinterpret_cast<const IMAGE_NT_HEADERS64*>(image);
+const IMAGE_NT_HEADERS64 *get_nt_headers(const std::uint8_t *image)
+{
+   auto dos_header = reinterpret_cast<const IMAGE_DOS_HEADER *>(image);
+   return reinterpret_cast<const IMAGE_NT_HEADERS64 *>(image + dos_header->e_lfanew);
 }
 
-// Helper function to convert section characteristics to memory protection flags
-DWORD get_protection_flags(DWORD characteristics) {
-    DWORD protection = 0;
-    bool executable = (characteristics & IMAGE_SCN_MEM_EXECUTE) != 0;
-    bool readable = (characteristics & IMAGE_SCN_MEM_READ) != 0;
-    bool writeable = (characteristics & IMAGE_SCN_MEM_WRITE) != 0;
-    
-    if (executable) {
-        if (writeable) {
-            protection = PAGE_EXECUTE_READWRITE;
-        } else {
-            protection = readable ? PAGE_EXECUTE_READ : PAGE_EXECUTE;
-        }
-    } else {
-        if (writeable) {
-            protection = readable ? PAGE_READWRITE : PAGE_WRITECOPY;
-        } else {
-            protection = readable ? PAGE_READONLY : PAGE_NOACCESS;
-        }
-    }
-    
-    if (characteristics & IMAGE_SCN_MEM_NOT_CACHED) {
-        protection |= PAGE_NOCACHE;
-    }
-    
-    return protection;
+struct MinimalHeaders
+{
+   MINIMAL_IMAGE_DOS_HEADER dos = {};
+   MINIMAL_IMAGE_NT_HEADERS64 nt = {};
+   std::vector<MINIMAL_IMAGE_SECTION_HEADER> sections;
+};
+
+MinimalHeaders get_minimal_headers()
+{
+   // find our packed headers section
+   auto base = reinterpret_cast<const std::uint8_t *>(GetModuleHandleA(NULL));
+   auto nt_header = get_nt_headers(base);
+   auto section_table = reinterpret_cast<const IMAGE_SECTION_HEADER *>(
+       reinterpret_cast<const std::uint8_t *>(&nt_header->OptionalHeader) + nt_header->FileHeader.SizeOfOptionalHeader);
+   const IMAGE_SECTION_HEADER *packed_headers_section = nullptr;
+
+   for (std::uint16_t i = 0; i < nt_header->FileHeader.NumberOfSections; ++i)
+   {
+      if (std::memcmp(section_table[i].Name, ".pack0", 7) == 0)
+      {
+         packed_headers_section = &section_table[i];
+         break;
+      }
+   }
+
+   if (packed_headers_section == nullptr)
+   {
+      std::cerr << "Error: couldn't find packed headers section in binary." << std::endl;
+      ExitProcess(STUB_ERROR_FILE_NOT_FOUND);
+   }
+
+   // decompress our packed headers
+   auto section_start = base + packed_headers_section->VirtualAddress;
+   auto unpacked_size = *reinterpret_cast<const std::size_t *>(section_start);
+   auto packed_data = section_start + sizeof(std::size_t);
+   auto packed_size = packed_headers_section->Misc.VirtualSize - sizeof(std::size_t);
+
+   auto decompressed = std::vector<std::uint8_t>(unpacked_size);
+   SIZE_T decompressed_size = static_cast<SIZE_T>(unpacked_size);
+
+   COMPRESSOR_HANDLE compressor = NULL;
+   if (!CreateDecompressor(COMPRESS_ALGORITHM_MSZIP, NULL, &compressor))
+   {
+      std::cerr << "Error: couldn't create decompressor. Error: " << GetLastError() << std::endl;
+      ExitProcess(STUB_ERROR_DECOMPRESS_FAILED);
+   }
+
+   if (!Decompress(compressor, packed_data, packed_size, decompressed.data(), decompressed_size, &decompressed_size))
+   {
+      std::cerr << "Error: couldn't decompress headers. Error: " << GetLastError() << std::endl;
+      CloseDecompressor(compressor);
+      ExitProcess(STUB_ERROR_DECOMPRESS_FAILED);
+   }
+
+   CloseDecompressor(compressor);
+
+   // Parse minimal headers from decompressed data
+   MinimalHeaders headers;
+   auto data = decompressed.data();
+
+   // Copy DOS header
+   memcpy(&headers.dos, data, sizeof(MINIMAL_IMAGE_DOS_HEADER));
+   data += sizeof(MINIMAL_IMAGE_DOS_HEADER);
+
+   // Copy NT headers
+   memcpy(&headers.nt, data, sizeof(MINIMAL_IMAGE_NT_HEADERS64));
+   data += sizeof(MINIMAL_IMAGE_NT_HEADERS64);
+
+   // Copy section headers
+   headers.sections.resize(headers.nt.FileHeader.NumberOfSections);
+   memcpy(headers.sections.data(), data,
+          sizeof(MINIMAL_IMAGE_SECTION_HEADER) * headers.nt.FileHeader.NumberOfSections);
+
+   return headers;
 }
 
-// Helper: decompress a packed section
-std::vector<std::uint8_t> decompress_section(const std::uint8_t* section_start, DWORD section_size) {
-    auto unpacked_size = *reinterpret_cast<const std::size_t*>(section_start);
-    auto packed_data = section_start + sizeof(std::size_t);
-    auto packed_size = section_size - sizeof(std::size_t);
-    std::vector<std::uint8_t> out(unpacked_size);
+std::vector<std::uint8_t> get_image()
+{
+   // find our packed section
+   auto base = reinterpret_cast<const std::uint8_t *>(GetModuleHandleA(NULL));
+   auto nt_header = get_nt_headers(base);
+   auto section_table = reinterpret_cast<const IMAGE_SECTION_HEADER *>(
+       reinterpret_cast<const std::uint8_t *>(&nt_header->OptionalHeader) + nt_header->FileHeader.SizeOfOptionalHeader);
+   const IMAGE_SECTION_HEADER *packed_section = nullptr;
 
-    DECOMPRESSOR_HANDLE decompressor = nullptr;
-    if (!CreateDecompressor(COMPRESS_ALGORITHM_MSZIP, nullptr, &decompressor)) {
-        std::cerr << "Error: couldn't create decompressor." << std::endl;
-        ExitProcess(100);
-    }
+   for (std::uint16_t i = 0; i < nt_header->FileHeader.NumberOfSections; ++i)
+   {
+      if (std::memcmp(section_table[i].Name, ".pack1", 7) == 0)
+      {
+         packed_section = &section_table[i];
+         break;
+      }
+   }
 
-    SIZE_T decompressed_size = 0;
-    if (!Decompress(decompressor, packed_data, packed_size, out.data(), out.size(), &decompressed_size)) {
-        std::cerr << "Error: couldn't decompress section data." << std::endl;
-        CloseDecompressor(decompressor);
-        ExitProcess(100);
-    }
+   if (packed_section == nullptr)
+   {
+      std::cerr << "Error: couldn't find packed section in binary." << std::endl;
+      ExitProcess(STUB_ERROR_FILE_NOT_FOUND);
+   }
 
-    CloseDecompressor(decompressor);
-    return out;
+   // decompress our packed image
+   auto section_start = base + packed_section->VirtualAddress;
+   auto unpacked_size = *reinterpret_cast<const std::size_t *>(section_start);
+   auto packed_data = section_start + sizeof(std::size_t);
+   auto packed_size = packed_section->Misc.VirtualSize - sizeof(std::size_t);
+
+   auto decompressed = std::vector<std::uint8_t>(unpacked_size);
+   SIZE_T decompressed_size = static_cast<SIZE_T>(unpacked_size);
+
+   COMPRESSOR_HANDLE compressor = NULL;
+   if (!CreateDecompressor(COMPRESS_ALGORITHM_MSZIP, NULL, &compressor))
+   {
+      std::cerr << "Error: couldn't create decompressor. Error: " << GetLastError() << std::endl;
+      ExitProcess(STUB_ERROR_DECOMPRESS_FAILED);
+   }
+
+   if (!Decompress(compressor, packed_data, packed_size, decompressed.data(), decompressed_size, &decompressed_size))
+   {
+      std::cerr << "Error: couldn't decompress image data. Error: " << GetLastError() << std::endl;
+      CloseDecompressor(compressor);
+      ExitProcess(STUB_ERROR_DECOMPRESS_FAILED);
+   }
+
+   CloseDecompressor(compressor);
+   return decompressed;
 }
 
-// Helper: find section bounds
-void find_section_bounds(const IMAGE_SECTION_HEADER* section_table, int num_sections, uintptr_t& min_va, uintptr_t& max_va, DWORD& max_raw_size) {
-    min_va = (uintptr_t)-1;
-    max_va = 0;
-    max_raw_size = 0;
-    for (int i = 0; i < num_sections; ++i) {
-        // Fix for Warning C26451: Cast to wider type before arithmetic
-        uintptr_t current_va = static_cast<uintptr_t>(section_table[i].VirtualAddress);
-        uintptr_t virtual_size = static_cast<uintptr_t>(section_table[i].Misc.VirtualSize);
-        
-        if (current_va < min_va) min_va = current_va;
-        if (current_va + virtual_size > max_va) max_va = current_va + virtual_size;
-        if (section_table[i].SizeOfRawData > max_raw_size) max_raw_size = section_table[i].SizeOfRawData;
-    }
+DWORD get_section_protection(DWORD characteristics)
+{
+   DWORD protection = PAGE_NOACCESS;
+
+   if (characteristics & IMAGE_SCN_MEM_EXECUTE)
+   {
+      if (characteristics & IMAGE_SCN_MEM_WRITE)
+      {
+         protection = PAGE_EXECUTE_READWRITE;
+      }
+      else if (characteristics & IMAGE_SCN_MEM_READ)
+      {
+         protection = PAGE_EXECUTE_READ;
+      }
+      else
+      {
+         protection = PAGE_EXECUTE;
+      }
+   }
+   else if (characteristics & IMAGE_SCN_MEM_WRITE)
+   {
+      protection = PAGE_READWRITE;
+   }
+   else if (characteristics & IMAGE_SCN_MEM_READ)
+   {
+      protection = PAGE_READONLY;
+   }
+
+   return protection;
 }
 
-std::uint8_t* load_sections_only(const std::vector<std::uint8_t>& headers, const std::vector<std::uint8_t>& sections_data) {
-    const IMAGE_NT_HEADERS64* nt_header = get_nt_headers(headers.data());
-    const IMAGE_SECTION_HEADER* section_table = reinterpret_cast<const IMAGE_SECTION_HEADER*>(
-        reinterpret_cast<const std::uint8_t*>(&nt_header->OptionalHeader) + nt_header->FileHeader.SizeOfOptionalHeader
-    );
-    int num_sections = nt_header->FileHeader.NumberOfSections;
+void set_section_protections(std::uint8_t *base, const MinimalHeaders &headers)
+{
+   for (WORD i = 0; i < headers.nt.FileHeader.NumberOfSections; ++i)
+   {
+      DWORD protection = get_section_protection(headers.sections[i].Characteristics);
+      DWORD old_protection;
 
-    // Find bounds
-    uintptr_t min_va, max_va;
-    DWORD max_raw_size;
-    find_section_bounds(section_table, num_sections, min_va, max_va, max_raw_size);
-    size_t total_size = max_va - min_va;
+      if (!VirtualProtect(base + headers.sections[i].VirtualAddress,
+                          headers.sections[i].SizeOfRawData,
+                          protection,
+                          &old_protection))
+      {
+         std::cerr << "Error: failed to set section protection. Error: " << GetLastError() << std::endl;
+         ExitProcess(STUB_ERROR_ALLOC_FAILED);
+      }
+   }
+}
 
-    // Initially allocate with PAGE_READWRITE for loading and fixups
-    std::uint8_t* base = reinterpret_cast<std::uint8_t*>(VirtualAlloc(nullptr, total_size, 
-        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-    if (!base) {
-        std::cerr << "Error: VirtualAlloc failed: Windows error " << GetLastError() << std::endl;
-        ExitProcess(5);
-    }
+std::uint8_t *load_image(const std::vector<std::uint8_t> &image, const MinimalHeaders &headers)
+{
+   // create a new VirtualAlloc'd buffer with read and write privileges
+   auto image_size = headers.nt.OptionalHeader.SizeOfImage;
+   auto base = reinterpret_cast<std::uint8_t *>(VirtualAlloc(nullptr,
+                                                             image_size,
+                                                             MEM_COMMIT | MEM_RESERVE,
+                                                             PAGE_READWRITE));
 
-    // Copy each section to its mapped address
-    auto first_section_offset = section_table[0].PointerToRawData;
-    for (int i = 0; i < num_sections; ++i) {
-        if (section_table[i].SizeOfRawData > 0) {
-            auto section_offset = section_table[i].PointerToRawData - first_section_offset;
-            if (section_offset < sections_data.size()) {
-                auto dest = base + (section_table[i].VirtualAddress - min_va);
-                std::memcpy(dest,
-                    sections_data.data() + section_offset,
-                    std::min<DWORD>(section_table[i].SizeOfRawData, 
-                        static_cast<DWORD>(sections_data.size() - section_offset)));
+   if (base == nullptr)
+   {
+      std::cerr << "Error: VirtualAlloc failed: Windows error " << GetLastError() << std::endl;
+      ExitProcess(STUB_ERROR_ALLOC_FAILED);
+   }
+
+   // Zero initialize the entire buffer
+   std::memset(base, 0, image_size);
+
+   // Copy sections to their proper locations
+   size_t image_offset = 0;
+   for (WORD i = 0; i < headers.nt.FileHeader.NumberOfSections; ++i)
+   {
+      if (headers.sections[i].SizeOfRawData > 0)
+      {
+         std::memcpy(base + headers.sections[i].VirtualAddress,
+                     image.data() + image_offset,
+                     headers.sections[i].SizeOfRawData);
+         image_offset += headers.sections[i].SizeOfRawData;
+      }
+   }
+
+   return base;
+}
+
+// Helper function to create an intermediate function
+std::uint8_t *create_intermediate_function(std::uint8_t *base, std::uint8_t *target_function)
+{
+   // Allocate memory for the intermediate function
+   // We need 14 bytes for the function code
+   auto intermediate = reinterpret_cast<std::uint8_t *>(VirtualAlloc(nullptr,
+                                                                     14,
+                                                                     MEM_COMMIT | MEM_RESERVE,
+                                                                     PAGE_EXECUTE_READWRITE));
+   if (!intermediate)
+   {
+      std::cerr << "Error: failed to allocate intermediate function. Error: " << GetLastError() << std::endl;
+      ExitProcess(STUB_ERROR_ALLOC_FAILED);
+   }
+
+   // Create the intermediate function code:
+   // mov rax, target_function
+   // jmp rax
+   intermediate[0] = 0x48; // REX.W prefix
+   intermediate[1] = 0xB8; // MOV RAX, imm64
+   *reinterpret_cast<std::uint64_t *>(&intermediate[2]) = reinterpret_cast<std::uint64_t>(target_function);
+   intermediate[10] = 0xFF; // JMP RAX
+   intermediate[11] = 0xE0;
+
+   return intermediate;
+}
+
+// List of DLLs that are safe to redirect (don't use vtables)
+const char *safe_redirect_dlls[] = {
+    "kernel32.dll",
+    "ntdll.dll",
+    "advapi32.dll",
+    "user32.dll",
+    "gdi32.dll",
+    "comdlg32.dll",
+    "shell32.dll",
+    "ole32.dll",
+    "oleaut32.dll",
+    "ws2_32.dll",
+    "wininet.dll",
+    "crypt32.dll",
+    "shlwapi.dll",
+    "msvcrt.dll",
+    "version.dll",
+    "psapi.dll",
+    "iphlpapi.dll",
+    "secur32.dll",
+    "wtsapi32.dll",
+    "netapi32.dll",
+    nullptr // Sentinel
+};
+
+bool is_safe_to_redirect(const char *dll_name)
+{
+   // Convert to lowercase for comparison
+   char lower_dll[MAX_PATH];
+   strcpy_s(lower_dll, dll_name);
+   _strlwr_s(lower_dll);
+
+   // Check against our list
+   for (int i = 0; safe_redirect_dlls[i] != nullptr; i++)
+   {
+      if (_stricmp(lower_dll, safe_redirect_dlls[i]) == 0)
+      {
+         return true;
+      }
+   }
+   return false;
+}
+
+void load_imports(std::uint8_t *image, const MinimalHeaders &headers)
+{
+   // get the import table directory entry
+   auto directory_entry = headers.nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+
+   // if there are no imports, that's fine-- return because there's nothing to do.
+   if (directory_entry.VirtualAddress == 0)
+   {
+      return;
+   }
+
+   // get a pointer to the import descriptor array
+   auto import_table = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR *>(image + directory_entry.VirtualAddress);
+
+   // when we reach an OriginalFirstThunk value that is zero, that marks the end of our array.
+   while (import_table->OriginalFirstThunk != 0)
+   {
+      // get a string pointer to the DLL to load.
+      auto dll_name = reinterpret_cast<char *>(image + import_table->Name);
+
+      // load the DLL with our import.
+      auto dll_import = LoadLibraryA(dll_name);
+
+      if (dll_import == nullptr)
+      {
+         std::cerr << "Error: failed to load DLL from import table: " << dll_name << std::endl;
+         ExitProcess(STUB_ERROR_LOAD_DLL_FAILED);
+      }
+
+      // load the array which contains our import entries
+      auto lookup_table = reinterpret_cast<IMAGE_THUNK_DATA64 *>(image + import_table->OriginalFirstThunk);
+
+      // load the array which will contain our resolved imports
+      auto address_table = reinterpret_cast<IMAGE_THUNK_DATA64 *>(image + import_table->FirstThunk);
+
+      // Check if this DLL is safe to redirect
+      bool safe_to_redirect = is_safe_to_redirect(dll_name);
+
+      while (lookup_table->u1.AddressOfData != 0)
+      {
+         FARPROC function = nullptr;
+         auto lookup_address = lookup_table->u1.AddressOfData;
+
+         if ((lookup_address & IMAGE_ORDINAL_FLAG64) != 0)
+         {
+            function = GetProcAddress(dll_import,
+                                      reinterpret_cast<LPSTR>(lookup_address & 0xFFFFFFFF));
+
+            if (function == nullptr)
+            {
+               std::cerr << "Error: failed ordinal lookup for " << dll_name << ": " << (lookup_address & 0xFFFFFFFF) << std::endl;
+               ExitProcess(STUB_ERROR_GET_PROC_ADDRESS_FAILED);
             }
-        }
-    }
+         }
+         else
+         {
+            auto import_name = reinterpret_cast<IMAGE_IMPORT_BY_NAME *>(image + lookup_address);
+            function = GetProcAddress(dll_import, import_name->Name);
 
-    return base - min_va; // So that VirtualAddress in headers can be used as (base + VA)
-}
-
-// Apply final memory permissions after all fixups
-void apply_memory_permissions(std::uint8_t* mapped_base, const std::vector<std::uint8_t>& headers) {
-    const IMAGE_NT_HEADERS64* nt_header = get_nt_headers(headers.data());
-    const IMAGE_SECTION_HEADER* section_table = reinterpret_cast<const IMAGE_SECTION_HEADER*>(
-        reinterpret_cast<const std::uint8_t*>(&nt_header->OptionalHeader) + nt_header->FileHeader.SizeOfOptionalHeader
-    );
-    int num_sections = nt_header->FileHeader.NumberOfSections;
-
-    // Find min VA for offset calculation
-    uintptr_t min_va = (uintptr_t)-1;
-    for (int i = 0; i < num_sections; ++i) {
-        if (section_table[i].VirtualAddress < min_va) min_va = section_table[i].VirtualAddress;
-    }
-
-    // Apply protections
-    DWORD old_protect;
-    for (int i = 0; i < num_sections; ++i) {
-        if (section_table[i].Misc.VirtualSize > 0) {
-            auto section_base = mapped_base + section_table[i].VirtualAddress;
-            auto section_size = section_table[i].Misc.VirtualSize;
-            DWORD protection = get_protection_flags(section_table[i].Characteristics);
-            
-            if (!VirtualProtect(section_base, section_size, protection, &old_protect)) {
-                std::cerr << "Error: Failed to set section protection: Windows error " << GetLastError() << std::endl;
-                ExitProcess(6);
+            if (function == nullptr)
+            {
+               std::cerr << "Error: failed named lookup: " << dll_name << "!" << import_name->Name << std::endl;
+               ExitProcess(STUB_ERROR_GET_PROC_ADDRESS_BY_NAME_FAILED);
             }
-        }
-    }
-}
 
-// Patch: all fixups/imports must use (base + VA) where base = returned pointer from load_sections_only
-void load_imports_sections(std::uint8_t* base, const std::vector<std::uint8_t>& headers) {
-    const IMAGE_NT_HEADERS64* nt_header = get_nt_headers(headers.data());
-    auto directory_entry = nt_header->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-    if (directory_entry.VirtualAddress == 0) return;
-    auto import_table = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(base + directory_entry.VirtualAddress);
-    while (import_table->OriginalFirstThunk != 0) {
-        auto dll_name = reinterpret_cast<char*>(base + import_table->Name);
-        auto dll_import = LoadLibraryA(dll_name);
-        if (!dll_import) {
-            std::cerr << "Error: failed to load DLL from import table: " << dll_name << std::endl;
-            ExitProcess(6);
-        }
-        auto lookup_table = reinterpret_cast<IMAGE_THUNK_DATA64*>(base + import_table->OriginalFirstThunk);
-        auto address_table = reinterpret_cast<IMAGE_THUNK_DATA64*>(base + import_table->FirstThunk);
-        while (lookup_table->u1.AddressOfData != 0) {
-            FARPROC function = nullptr;
-            auto lookup_address = lookup_table->u1.AddressOfData;
-            if ((lookup_address & IMAGE_ORDINAL_FLAG64) != 0) {
-                function = GetProcAddress(dll_import, reinterpret_cast<LPSTR>(lookup_address & 0xFFFFFFFF));
-                if (!function) {
-                    std::cerr << "Error: failed ordinal lookup for " << dll_name << ": " << (lookup_address & 0xFFFFFFFF) << std::endl;
-                    ExitProcess(7);
-                }
-            } else {
-                auto import_name = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(base + lookup_address);
-                function = GetProcAddress(dll_import, import_name->Name);
-                if (!function) {
-                    std::cerr << "Error: failed named lookup: " << dll_name << "!" << import_name->Name << std::endl;
-                    ExitProcess(8);
-                }
-                // Clear the function name from the import name table
-                std::memset(import_name->Name, 0, strlen(reinterpret_cast<const char*>(import_name->Name)));
-            }
-            // Store resolved function address
+            // Zero out the function name and hint after use
+            std::memset(import_name->Name, 0, strlen(import_name->Name));
+            import_name->Hint = 0;
+         }
+
+         // Only create intermediate functions for DLLs that are safe to redirect
+         if (safe_to_redirect)
+         {
+            auto intermediate = create_intermediate_function(image, reinterpret_cast<std::uint8_t *>(function));
+            address_table->u1.Function = reinterpret_cast<std::uint64_t>(intermediate);
+         }
+         else
+         {
+            // For unsafe DLLs, use the function address directly
             address_table->u1.Function = reinterpret_cast<std::uint64_t>(function);
-            // Clear the lookup table entry
-            lookup_table->u1.AddressOfData = 0;
-            ++lookup_table;
-            ++address_table;
-        }
-        // Clear DLL name after resolving all its imports
-        std::memset(dll_name, 0, strlen(dll_name));
-        ++import_table;
-    }
-    // Optional: Clear the entire import directory after resolving all imports
-    std::memset(reinterpret_cast<void*>(base + directory_entry.VirtualAddress), 0, directory_entry.Size);
+         }
+
+         ++lookup_table;
+         ++address_table;
+      }
+
+      // Zero out the DLL name after use
+      std::memset(dll_name, 0, strlen(dll_name));
+
+      ++import_table;
+   }
+
+   // Zero out the entire import directory
+   std::memset(image + directory_entry.VirtualAddress, 0, directory_entry.Size);
 }
 
-void relocate_sections(std::uint8_t* base, const std::vector<std::uint8_t>& headers) {
-    const IMAGE_NT_HEADERS64* nt_header = get_nt_headers(headers.data());
-    if ((nt_header->OptionalHeader.DllCharacteristics & IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE) == 0) {
-        std::cerr << "Error: image cannot be relocated." << std::endl;
-        ExitProcess(9);
-    }
-    auto directory_entry = nt_header->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
-    if (directory_entry.VirtualAddress == 0) {
-        std::cerr << "Error: image can be relocated, but contains no relocation directory." << std::endl;
-        ExitProcess(10);
-    }
-    std::uintptr_t delta = reinterpret_cast<std::uintptr_t>(base) - nt_header->OptionalHeader.ImageBase;
-    auto relocation_table = reinterpret_cast<IMAGE_BASE_RELOCATION*>(base + directory_entry.VirtualAddress);
-    
-    // Process relocations
-    while (relocation_table->VirtualAddress != 0) {
-        std::size_t relocations = (relocation_table->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(std::uint16_t);
-        auto relocation_data = reinterpret_cast<std::uint16_t*>(&relocation_table[1]);
-        for (std::size_t i = 0; i < relocations; ++i) {
-            auto relocation = relocation_data[i];
-            std::uint16_t type = relocation >> 12;
-            std::uint16_t offset = relocation & 0xFFF;
-            auto ptr = reinterpret_cast<std::uintptr_t*>(base + relocation_table->VirtualAddress + offset);
-            if (type == IMAGE_REL_BASED_DIR64)
-                *ptr += delta;
-        }
-        relocation_table = reinterpret_cast<IMAGE_BASE_RELOCATION*>(reinterpret_cast<std::uint8_t*>(relocation_table) + relocation_table->SizeOfBlock);
-    }
+void relocate(std::uint8_t *image, const MinimalHeaders &headers)
+{
+   // first, check if we can even relocate the image
+   if ((headers.nt.OptionalHeader.DllCharacteristics & IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE) == 0)
+   {
+      std::cerr << "Error: image cannot be relocated." << std::endl;
+      ExitProcess(STUB_ERROR_RELOCATION_FAILED);
+   }
 
-    // Wipe relocation directory after processing
-    DWORD old_protect;
-    auto reloc_addr = base + directory_entry.VirtualAddress;
-    if (VirtualProtect(reloc_addr, directory_entry.Size, PAGE_READWRITE, &old_protect)) {
-        // Zero out the entire relocation directory
-        std::memset(reloc_addr, 0, directory_entry.Size);
-        
-        // Restore original protection
-        VirtualProtect(reloc_addr, directory_entry.Size, old_protect, &old_protect);
-    }
+   // once we know we can relocate the image, make sure a relocation directory is present
+   auto directory_entry = headers.nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+
+   if (directory_entry.VirtualAddress == 0)
+   {
+      std::cerr << "Error: image can be relocated, but contains no relocation directory." << std::endl;
+      ExitProcess(STUB_ERROR_NO_RELOCATION_DIRECTORY);
+   }
+
+   // calculate the difference between the image base in the compiled image
+   // and the current virtually allocated image
+   std::uintptr_t delta = reinterpret_cast<std::uintptr_t>(image) - headers.nt.OptionalHeader.ImageBase;
+
+   // get the relocation table
+   auto relocation_table = reinterpret_cast<IMAGE_BASE_RELOCATION *>(image + directory_entry.VirtualAddress);
+   auto relocation_table_end = reinterpret_cast<std::uint8_t *>(relocation_table);
+
+   // when the virtual address for our relocation header is null,
+   // we've reached the end of the relocation table
+   while (relocation_table->VirtualAddress != 0)
+   {
+      std::size_t relocations = (relocation_table->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(std::uint16_t);
+      auto relocation_data = reinterpret_cast<std::uint16_t *>(&relocation_table[1]);
+
+      for (std::size_t i = 0; i < relocations; ++i)
+      {
+         auto relocation = relocation_data[i];
+         std::uint16_t type = relocation >> 12;
+         std::uint16_t offset = relocation & 0xFFF;
+         auto ptr = reinterpret_cast<std::uintptr_t *>(image + relocation_table->VirtualAddress + offset);
+
+         if (type == IMAGE_REL_BASED_DIR64)
+            *ptr += delta;
+      }
+
+      relocation_table_end = reinterpret_cast<std::uint8_t *>(relocation_table) + relocation_table->SizeOfBlock;
+      relocation_table = reinterpret_cast<IMAGE_BASE_RELOCATION *>(relocation_table_end);
+   }
+
+   // Zero out the entire relocation directory
+   std::memset(image + directory_entry.VirtualAddress, 0, directory_entry.Size);
 }
 
-// Function pointer types for indirect calls
-using fn_decompress_t = std::vector<std::uint8_t>(*)(const std::uint8_t*, DWORD);
-using fn_load_sections_t = std::uint8_t*(*)(const std::vector<std::uint8_t>&, const std::vector<std::uint8_t>&);
-using fn_imports_t = void(*)(std::uint8_t*, const std::vector<std::uint8_t>&);
-using fn_relocate_t = void(*)(std::uint8_t*, const std::vector<std::uint8_t>&);
-using fn_permissions_t = void(*)(std::uint8_t*, const std::vector<std::uint8_t>&);
+void restore_headers(std::uint8_t *image, const MinimalHeaders &headers)
+{
+   // Restore DOS header
+   auto dos_header = reinterpret_cast<IMAGE_DOS_HEADER *>(image);
+   dos_header->e_magic = IMAGE_DOS_SIGNATURE;
+   dos_header->e_lfanew = headers.dos.e_lfanew;
 
-// Indirect function table
-struct unpacking_vtable {
-    fn_decompress_t decompress;
-    fn_load_sections_t load_sections;
-    fn_imports_t imports;
-    fn_relocate_t relocate;
-    fn_permissions_t permissions;
+   // Restore NT headers
+   auto nt_header = reinterpret_cast<IMAGE_NT_HEADERS64 *>(image + dos_header->e_lfanew);
+   nt_header->Signature = IMAGE_NT_SIGNATURE;
+
+   // Restore FileHeader
+   nt_header->FileHeader.Machine = headers.nt.FileHeader.Machine;
+   nt_header->FileHeader.NumberOfSections = headers.nt.FileHeader.NumberOfSections;
+   nt_header->FileHeader.SizeOfOptionalHeader = headers.nt.FileHeader.SizeOfOptionalHeader;
+   nt_header->FileHeader.Characteristics = headers.nt.FileHeader.Characteristics;
+
+   // Restore OptionalHeader
+   nt_header->OptionalHeader.Magic = headers.nt.OptionalHeader.Magic;
+   nt_header->OptionalHeader.AddressOfEntryPoint = headers.nt.OptionalHeader.AddressOfEntryPoint;
+   nt_header->OptionalHeader.ImageBase = headers.nt.OptionalHeader.ImageBase;
+   nt_header->OptionalHeader.SectionAlignment = headers.nt.OptionalHeader.SectionAlignment;
+   nt_header->OptionalHeader.FileAlignment = headers.nt.OptionalHeader.FileAlignment;
+   nt_header->OptionalHeader.SizeOfImage = headers.nt.OptionalHeader.SizeOfImage;
+   nt_header->OptionalHeader.SizeOfHeaders = headers.nt.OptionalHeader.SizeOfHeaders;
+   nt_header->OptionalHeader.Subsystem = headers.nt.OptionalHeader.Subsystem;
+   nt_header->OptionalHeader.DllCharacteristics = headers.nt.OptionalHeader.DllCharacteristics;
+
+   // Restore Data Directories
+   memcpy(&nt_header->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT],
+          &headers.nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT],
+          sizeof(IMAGE_DATA_DIRECTORY));
+   memcpy(&nt_header->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC],
+          &headers.nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC],
+          sizeof(IMAGE_DATA_DIRECTORY));
+
+   // Restore Section Headers
+   auto section_table = reinterpret_cast<IMAGE_SECTION_HEADER *>(
+       reinterpret_cast<std::uint8_t *>(&nt_header->OptionalHeader) + nt_header->FileHeader.SizeOfOptionalHeader);
+
+   for (WORD i = 0; i < headers.nt.FileHeader.NumberOfSections; ++i)
+   {
+      memcpy(section_table[i].Name, headers.sections[i].Name, IMAGE_SIZEOF_SHORT_NAME);
+      section_table[i].Misc.VirtualSize = headers.sections[i].VirtualSize;
+      section_table[i].VirtualAddress = headers.sections[i].VirtualAddress;
+      section_table[i].SizeOfRawData = headers.sections[i].SizeOfRawData;
+      section_table[i].PointerToRawData = headers.sections[i].PointerToRawData;
+      section_table[i].Characteristics = headers.sections[i].Characteristics;
+   }
+}
+
+// Simple XOR-based encoder/decoder
+std::uint64_t encode_address(std::uint64_t address, std::uint64_t key)
+{
+   return address ^ key;
+}
+
+// Anti-debugging check
+bool is_debugger_present()
+{
+   BOOL isDebuggerPresent = FALSE;
+   CheckRemoteDebuggerPresent(GetCurrentProcess(), &isDebuggerPresent);
+   return isDebuggerPresent || IsDebuggerPresent();
+}
+
+// Check for hardware breakpoints
+bool has_hardware_breakpoints()
+{
+   CONTEXT ctx = {};
+   ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+
+   if (!GetThreadContext(GetCurrentThread(), &ctx))
+   {
+      return false;
+   }
+
+   // Check DR0-DR3 for any non-zero values
+   return (ctx.Dr0 != 0) || (ctx.Dr1 != 0) || (ctx.Dr2 != 0) || (ctx.Dr3 != 0);
+}
+
+// Entry point decoder with anti-debugging
+std::uint64_t decode_entry_point(std::uint64_t encoded_address, std::uint64_t key)
+{
+   // Anti-debugging checks
+   if (is_debugger_present() || has_hardware_breakpoints())
+   {
+      // If debugger is present or hardware breakpoints are set, return a bogus address
+      return 0;
+   }
+
+   // Decode the address
+   return encoded_address ^ key;
+}
+
+// Function pointer type for the entry point
+typedef void (*EntryPointFunc)();
+
+// Indirect jump to entry point with anti-debugging
+void jump_to_entry_point(std::uint64_t address)
+{
+   // Additional anti-debugging check
+   if (is_debugger_present() || has_hardware_breakpoints())
+   {
+      // If debugger is detected, jump to invalid address
+      reinterpret_cast<EntryPointFunc>(0)();
+      return;
+   }
+
+   // Use interlocked operations consistently
+   void* volatile* pAddress = reinterpret_cast<void* volatile*>(&address);
+   void* target = reinterpret_cast<void*>(address);
+   void* result = _InterlockedExchangePointer(pAddress, target);
+   
+   // Call the entry point using the result of the interlocked operation
+   reinterpret_cast<EntryPointFunc>(result)();
+}
+
+// Stage identifiers
+enum class Stage
+{
+   INIT,
+   LOAD,
+   FIXUP,
+   PROTECT,
+   EXECUTE
 };
 
-// Initialize function table with encrypted pointers (simple XOR for demonstration)
-unpacking_vtable init_vtable() {
-    const std::uint64_t key = 0x1234567890ABCDEF;
-    unpacking_vtable table;
-    auto encrypt = [key](void* ptr) -> std::uint64_t {
-        return reinterpret_cast<std::uint64_t>(ptr) ^ key;
-    };
-    
-    table.decompress = reinterpret_cast<fn_decompress_t>(encrypt(decompress_section));
-    table.load_sections = reinterpret_cast<fn_load_sections_t>(encrypt(load_sections_only));
-    table.imports = reinterpret_cast<fn_imports_t>(encrypt(load_imports_sections));
-    table.relocate = reinterpret_cast<fn_relocate_t>(encrypt(relocate_sections));
-    table.permissions = reinterpret_cast<fn_permissions_t>(encrypt(apply_memory_permissions));
-    return table;
+// Obfuscated stage transition function
+Stage next_stage(Stage current)
+{
+   // Use a simple but obfuscated transition
+   return static_cast<Stage>((static_cast<int>(current) + 1) % 5);
 }
 
-// Decrypt function pointer before use
-template<typename T>
-T decrypt_fn(std::uint64_t encrypted) {
-    const std::uint64_t key = 0x1234567890ABCDEF;
-    return reinterpret_cast<T>(encrypted ^ key);
-}
+// Obfuscated data structure for storing state
+struct ObfuscatedState
+{
+   std::uint8_t *image;
+   MinimalHeaders headers;
+   std::vector<std::uint8_t> raw_image;
+   Stage current_stage;
 
-// Split unpacking stages into smaller functions
-struct unpacking_context {
-    const std::uint8_t* base;
-    const IMAGE_SECTION_HEADER* headers_section;
-    const IMAGE_SECTION_HEADER* sections_section;
-    std::vector<std::uint8_t> headers;
-    std::uint8_t* mapped_base;
+   // Obfuscated constructor
+   ObfuscatedState() : image(nullptr), current_stage(Stage::INIT) {}
 };
 
-bool find_packed_sections(unpacking_context& ctx) {
-    auto dos_header = reinterpret_cast<const IMAGE_DOS_HEADER*>(ctx.base);
-    auto nt_header = reinterpret_cast<const IMAGE_NT_HEADERS64*>(ctx.base + dos_header->e_lfanew);
-    auto section_table = reinterpret_cast<const IMAGE_SECTION_HEADER*>(
-        reinterpret_cast<const std::uint8_t*>(&nt_header->OptionalHeader) + nt_header->FileHeader.SizeOfOptionalHeader
-    );
-    
-    for (std::uint16_t i = 0; i < nt_header->FileHeader.NumberOfSections; ++i) {
-        if (std::memcmp(section_table[i].Name, ".pack0", 7) == 0) ctx.headers_section = &section_table[i];
-        else if (std::memcmp(section_table[i].Name, ".pack1", 7) == 0) ctx.sections_section = &section_table[i];
-        if (ctx.headers_section && ctx.sections_section) return true;
-    }
-    return false;
+// Obfuscated initialization function
+bool initialize_stage(ObfuscatedState &state)
+{
+   if (state.current_stage != Stage::INIT)
+      return false;
+
+   // Get minimal headers from .pack0
+   state.headers = get_minimal_headers();
+   state.current_stage = next_stage(state.current_stage);
+   return true;
 }
 
-bool stage1_decompress(unpacking_context& ctx, const unpacking_vtable& vtable) {
-    auto decompress_fn = decrypt_fn<fn_decompress_t>(reinterpret_cast<std::uint64_t>(vtable.decompress));
-    ctx.headers = decompress_fn(ctx.base + ctx.headers_section->VirtualAddress, ctx.headers_section->Misc.VirtualSize);
-    return !ctx.headers.empty();
+// Obfuscated loading function
+bool load_stage(ObfuscatedState &state)
+{
+   if (state.current_stage != Stage::LOAD)
+      return false;
+
+   // Get and load the PE image
+   state.raw_image = get_image();
+   state.image = load_image(state.raw_image, state.headers);
+   state.current_stage = next_stage(state.current_stage);
+   return true;
 }
 
-bool stage2_map_sections(unpacking_context& ctx, const unpacking_vtable& vtable) {
-    auto load_fn = decrypt_fn<fn_load_sections_t>(reinterpret_cast<std::uint64_t>(vtable.load_sections));
-    auto sections = decrypt_fn<fn_decompress_t>(reinterpret_cast<std::uint64_t>(vtable.decompress))(
-        ctx.base + ctx.sections_section->VirtualAddress, 
-        ctx.sections_section->Misc.VirtualSize
-    );
-    ctx.mapped_base = load_fn(ctx.headers, sections);
-    return ctx.mapped_base != nullptr;
+// Obfuscated fixup function
+bool fixup_stage(ObfuscatedState &state)
+{
+   if (state.current_stage != Stage::FIXUP)
+      return false;
+
+   // Fix up the image
+   load_imports(state.image, state.headers);
+   relocate(state.image, state.headers);
+   restore_headers(state.image, state.headers);
+   state.current_stage = next_stage(state.current_stage);
+   return true;
 }
 
-bool stage3_process_imports(unpacking_context& ctx, const unpacking_vtable& vtable) {
-    auto imports_fn = decrypt_fn<fn_imports_t>(reinterpret_cast<std::uint64_t>(vtable.imports));
-    imports_fn(ctx.mapped_base, ctx.headers);
-    return true;
+// Obfuscated protection function
+bool protect_stage(ObfuscatedState &state)
+{
+   if (state.current_stage != Stage::PROTECT)
+      return false;
+
+   // Set proper memory protections
+   set_section_protections(state.image, state.headers);
+   state.current_stage = next_stage(state.current_stage);
+   return true;
 }
 
-bool stage4_relocate(unpacking_context& ctx, const unpacking_vtable& vtable) {
-    auto relocate_fn = decrypt_fn<fn_relocate_t>(reinterpret_cast<std::uint64_t>(vtable.relocate));
-    relocate_fn(ctx.mapped_base, ctx.headers);
-    return true;
+// Obfuscated execution function
+bool execute_stage(ObfuscatedState &state)
+{
+   if (state.current_stage != Stage::EXECUTE)
+      return false;
+
+   // Get and encode the entry point
+   auto entrypoint = state.image + state.headers.nt.OptionalHeader.AddressOfEntryPoint;
+
+   // Generate a random key for encoding
+   std::uint64_t key = 0;
+   for (int i = 0; i < 8; i++)
+   {
+      key = (key << 8) | (GetTickCount64() & 0xFF);
+   }
+
+   // Encode the entry point address
+   std::uint64_t encoded_entrypoint = encode_address(reinterpret_cast<std::uint64_t>(entrypoint), key);
+
+   // Decode and jump to the entry point
+   std::uint64_t decoded_entrypoint = decode_entry_point(encoded_entrypoint, key);
+   if (decoded_entrypoint != 0)
+   {
+      jump_to_entry_point(decoded_entrypoint);
+   }
+
+   return true;
 }
 
-bool stage5_finalize(unpacking_context& ctx, const unpacking_vtable& vtable) {
-    auto permissions_fn = decrypt_fn<fn_permissions_t>(reinterpret_cast<std::uint64_t>(vtable.permissions));
-    permissions_fn(ctx.mapped_base, ctx.headers);
-    return true;
+// List of common VM-related processes
+const wchar_t *vm_processes[] = {
+    L"vboxservice.exe",
+    L"vboxtray.exe",
+    L"vmtoolsd.exe",
+    L"vmwaretray.exe",
+    L"vmwareuser.exe",
+    L"vmusrvc.exe",
+    L"qemu-ga.exe",
+    nullptr};
+
+// Check for VM processes
+bool check_vm_processes()
+{
+   HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+   if (snapshot == INVALID_HANDLE_VALUE)
+   {
+      return false;
+   }
+
+   PROCESSENTRY32W pe32;
+   pe32.dwSize = sizeof(PROCESSENTRY32W);
+
+   if (!Process32FirstW(snapshot, &pe32))
+   {
+      CloseHandle(snapshot);
+      return false;
+   }
+
+   do
+   {
+      for (int i = 0; vm_processes[i] != nullptr; i++)
+      {
+         if (_wcsicmp(pe32.szExeFile, vm_processes[i]) == 0)
+         {
+            CloseHandle(snapshot);
+            return true;
+         }
+      }
+   } while (Process32NextW(snapshot, &pe32));
+
+   CloseHandle(snapshot);
+   return false;
 }
 
-void* get_entry_point(const unpacking_context& ctx) {
-    const IMAGE_NT_HEADERS64* orig_nt_headers = get_nt_headers(ctx.headers.data());
-    return reinterpret_cast<void*>(ctx.mapped_base + orig_nt_headers->OptionalHeader.AddressOfEntryPoint);
+// Check for VM using multiple techniques
+bool is_running_in_vm()
+{
+   // Check for VM processes
+   if (check_vm_processes())
+   {
+      return true;
+   }
+
+   return false;
 }
 
-using entry_point_t = void(*)();
+// Modified execute_workflow to include VM checks
+void execute_workflow()
+{
+   // Check for VM before proceeding
+   if (is_running_in_vm())
+   {
+      // If in VM, exit or perform alternative behavior
+      ExitProcess(0);
+   }
 
-void* prepare_entry_point(void* entry) {
-    // Basic address obfuscation
-    auto addr = reinterpret_cast<std::uint64_t>(entry);
-    addr ^= 0x1234567890ABCDEF;  // XOR with constant
-    addr += 0x42424242;          // Add constant
-    addr ^= 0x42424242;          // XOR again
-    addr -= 0x42424242;          // Subtract the same constant
-    addr ^= 0x1234567890ABCDEF;  // Reverse first XOR
-    return reinterpret_cast<void*>(addr);
+   ObfuscatedState state;
+
+   // Execute stages in sequence with obfuscated transitions
+   while (true)
+   {
+      // Additional VM check at each stage
+      if (is_running_in_vm())
+      {
+         ExitProcess(0);
+      }
+
+      switch (state.current_stage)
+      {
+      case Stage::INIT:
+         if (!initialize_stage(state))
+            return;
+         break;
+      case Stage::LOAD:
+         if (!load_stage(state))
+            return;
+         break;
+      case Stage::FIXUP:
+         if (!fixup_stage(state))
+            return;
+         break;
+      case Stage::PROTECT:
+         if (!protect_stage(state))
+            return;
+         break;
+      case Stage::EXECUTE:
+         // Final execution stage
+         execute_stage(state);
+         return;
+      default:
+         return;
+      }
+   }
 }
 
-void execute_entry(void* obfuscated_entry) {
-    // Deobfuscate and execute
-    auto addr = reinterpret_cast<std::uint64_t>(obfuscated_entry);
-    addr ^= 0x1234567890ABCDEF;
-    addr += 0x42424242;
-    addr ^= 0x42424242;
-    addr -= 0x42424242;
-    addr ^= 0x1234567890ABCDEF;
-    
-    auto fn = reinterpret_cast<entry_point_t>(addr);
-    fn();
-}
-
-int main(int argc, char* argv[]) {
-    // Initialize context and function table
-    unpacking_context ctx;
-    ctx.base = reinterpret_cast<const std::uint8_t*>(GetModuleHandleA(NULL));
-    ctx.headers_section = nullptr;
-    ctx.sections_section = nullptr;
-    ctx.mapped_base = nullptr;
-    
-    auto vtable = init_vtable();
-    
-    // State machine for unpacking stages
-    enum class stage_t : int { 
-        FIND_SECTIONS = 0, DECOMPRESS, MAP_SECTIONS, 
-        PROCESS_IMPORTS, RELOCATE, FINALIZE, EXECUTE, 
-        STAGE_ERROR 
-    };
-    
-    // Obfuscated control flow using switch-case state machine
-    stage_t current_stage = stage_t::FIND_SECTIONS;
-    bool success = true;
-    
-    while (current_stage != stage_t::STAGE_ERROR && current_stage != stage_t::EXECUTE) {
-        switch (current_stage) {
-            case stage_t::FIND_SECTIONS:
-            {
-                success = find_packed_sections(ctx);
-                current_stage = success ? stage_t::DECOMPRESS : stage_t::STAGE_ERROR;
-                break;
-            }
-            case stage_t::DECOMPRESS:
-            {
-                success = stage1_decompress(ctx, vtable);
-                current_stage = success ? stage_t::MAP_SECTIONS : stage_t::STAGE_ERROR;
-                break;
-            }
-            case stage_t::MAP_SECTIONS:
-            {
-                success = stage2_map_sections(ctx, vtable);
-                current_stage = success ? stage_t::PROCESS_IMPORTS : stage_t::STAGE_ERROR;
-                break;
-            }
-            case stage_t::PROCESS_IMPORTS:
-            {
-                success = stage3_process_imports(ctx, vtable);
-                current_stage = success ? stage_t::RELOCATE : stage_t::STAGE_ERROR;
-                break;
-            }
-            case stage_t::RELOCATE:
-            {
-                success = stage4_relocate(ctx, vtable);
-                current_stage = success ? stage_t::FINALIZE : stage_t::STAGE_ERROR;
-                break;
-            }
-            case stage_t::FINALIZE:
-            {
-                success = stage5_finalize(ctx, vtable);
-                current_stage = success ? stage_t::EXECUTE : stage_t::STAGE_ERROR;
-                break;
-            }
-            default:
-            {
-                current_stage = stage_t::STAGE_ERROR;
-                break;
-            }
-        }
-    }
-    
-    if (current_stage == stage_t::STAGE_ERROR) {
-        ExitProcess(101);
-    }
-    
-    // Execute unpacked binary with basic OEP obfuscation
-    auto entry = get_entry_point(ctx);
-    auto obfuscated = prepare_entry_point(entry);
-    execute_entry(obfuscated);
-    
-    return 0;
+int main()
+{
+   // Start the obfuscated workflow
+   execute_workflow();
+   return 0;
 }
