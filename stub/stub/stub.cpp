@@ -513,12 +513,108 @@ std::uint64_t encode_address(std::uint64_t address, std::uint64_t key)
    return address ^ key;
 }
 
-// Anti-debugging check
+// Custom exception handler
+LONG WINAPI CustomExceptionHandler(PEXCEPTION_POINTERS ExceptionInfo)
+{
+   if (ExceptionInfo->ExceptionRecord->ExceptionCode == 0xDEADBEEF) // Our custom exception code
+   {
+      std::cerr << "Security violation detected: VM or debugger detected!" << std::endl;
+      return EXCEPTION_EXECUTE_HANDLER;
+   }
+   return EXCEPTION_CONTINUE_SEARCH;
+}
+
+// Check if parent process is a debugger
+bool is_parent_debugger()
+{
+   HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+   if (snapshot == INVALID_HANDLE_VALUE)
+   {
+      return false;
+   }
+
+   PROCESSENTRY32W pe32;
+   pe32.dwSize = sizeof(PROCESSENTRY32W);
+
+   // Get current process ID
+   DWORD currentProcessId = GetCurrentProcessId();
+   DWORD parentProcessId = 0;
+
+   // Find parent process ID
+   if (Process32FirstW(snapshot, &pe32))
+   {
+      do
+      {
+         if (pe32.th32ProcessID == currentProcessId)
+         {
+            parentProcessId = pe32.th32ParentProcessID;
+            break;
+         }
+      } while (Process32NextW(snapshot, &pe32));
+   }
+
+   CloseHandle(snapshot);
+
+   if (parentProcessId == 0)
+   {
+      return false;
+   }
+
+   // List of common debugger process names
+   const wchar_t *debugger_processes[] = {
+       L"windbg.exe",
+       L"ollydbg.exe",
+       L"x64dbg.exe",
+       L"x32dbg.exe",
+       L"ida.exe",
+       L"ida64.exe",
+       L"devenv.exe",  // Visual Studio
+       L"vsdebug.exe", // Visual Studio Debugger
+       nullptr};
+
+   // Check if parent process is a debugger
+   snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+   if (snapshot == INVALID_HANDLE_VALUE)
+   {
+      return false;
+   }
+
+   pe32.dwSize = sizeof(PROCESSENTRY32W);
+
+   if (Process32FirstW(snapshot, &pe32))
+   {
+      do
+      {
+         if (pe32.th32ProcessID == parentProcessId)
+         {
+            for (int i = 0; debugger_processes[i] != nullptr; i++)
+            {
+               if (_wcsicmp(pe32.szExeFile, debugger_processes[i]) == 0)
+               {
+                  CloseHandle(snapshot);
+                  return true;
+               }
+            }
+            break;
+         }
+      } while (Process32NextW(snapshot, &pe32));
+   }
+
+   CloseHandle(snapshot);
+   return false;
+}
+
+// Modified anti-debugging check
 bool is_debugger_present()
 {
    BOOL isDebuggerPresent = FALSE;
    CheckRemoteDebuggerPresent(GetCurrentProcess(), &isDebuggerPresent);
-   return isDebuggerPresent || IsDebuggerPresent();
+   if (isDebuggerPresent || IsDebuggerPresent() || is_parent_debugger())
+   {
+      RaiseException(0xDEADBEEF, 0, 0, nullptr);
+      return true;
+   }
+   return false;
 }
 
 // Check for hardware breakpoints
@@ -534,6 +630,64 @@ bool has_hardware_breakpoints()
 
    // Check DR0-DR3 for any non-zero values
    return (ctx.Dr0 != 0) || (ctx.Dr1 != 0) || (ctx.Dr2 != 0) || (ctx.Dr3 != 0);
+}
+
+// Check for VM processes
+bool check_vm_processes()
+{
+   HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+   if (snapshot == INVALID_HANDLE_VALUE)
+   {
+      return false;
+   }
+
+   PROCESSENTRY32W pe32;
+   pe32.dwSize = sizeof(PROCESSENTRY32W);
+
+   if (!Process32FirstW(snapshot, &pe32))
+   {
+      CloseHandle(snapshot);
+      return false;
+   }
+
+   // List of common VM-related processes
+   const wchar_t *vm_processes[] = {
+       L"vboxservice.exe",
+       L"vboxtray.exe",
+       L"vmtoolsd.exe",
+       L"vmwaretray.exe",
+       L"vmwareuser.exe",
+       L"vmusrvc.exe",
+       L"qemu-ga.exe",
+       nullptr};
+
+   do
+   {
+      for (int i = 0; vm_processes[i] != nullptr; i++)
+      {
+         if (_wcsicmp(pe32.szExeFile, vm_processes[i]) == 0)
+         {
+            CloseHandle(snapshot);
+            return true;
+         }
+      }
+   } while (Process32NextW(snapshot, &pe32));
+
+   CloseHandle(snapshot);
+   return false;
+}
+
+// Modified VM check to raise exception
+bool is_running_in_vm()
+{
+   // Check for VM processes
+   if (check_vm_processes())
+   {
+      RaiseException(0xDEADBEEF, 0, 0, nullptr);
+      return true;
+   }
+
+   return false;
 }
 
 // Entry point decoder with anti-debugging
@@ -565,10 +719,10 @@ void jump_to_entry_point(std::uint64_t address)
    }
 
    // Use interlocked operations consistently
-   void* volatile* pAddress = reinterpret_cast<void* volatile*>(&address);
-   void* target = reinterpret_cast<void*>(address);
-   void* result = _InterlockedExchangePointer(pAddress, target);
-   
+   void *volatile *pAddress = reinterpret_cast<void *volatile *>(&address);
+   void *target = reinterpret_cast<void *>(address);
+   void *result = _InterlockedExchangePointer(pAddress, target);
+
    // Call the entry point using the result of the interlocked operation
    reinterpret_cast<EntryPointFunc>(result)();
 }
@@ -682,71 +836,17 @@ bool execute_stage(ObfuscatedState &state)
    return true;
 }
 
-// List of common VM-related processes
-const wchar_t *vm_processes[] = {
-    L"vboxservice.exe",
-    L"vboxtray.exe",
-    L"vmtoolsd.exe",
-    L"vmwaretray.exe",
-    L"vmwareuser.exe",
-    L"vmusrvc.exe",
-    L"qemu-ga.exe",
-    nullptr};
-
-// Check for VM processes
-bool check_vm_processes()
-{
-   HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-   if (snapshot == INVALID_HANDLE_VALUE)
-   {
-      return false;
-   }
-
-   PROCESSENTRY32W pe32;
-   pe32.dwSize = sizeof(PROCESSENTRY32W);
-
-   if (!Process32FirstW(snapshot, &pe32))
-   {
-      CloseHandle(snapshot);
-      return false;
-   }
-
-   do
-   {
-      for (int i = 0; vm_processes[i] != nullptr; i++)
-      {
-         if (_wcsicmp(pe32.szExeFile, vm_processes[i]) == 0)
-         {
-            CloseHandle(snapshot);
-            return true;
-         }
-      }
-   } while (Process32NextW(snapshot, &pe32));
-
-   CloseHandle(snapshot);
-   return false;
-}
-
-// Check for VM using multiple techniques
-bool is_running_in_vm()
-{
-   // Check for VM processes
-   if (check_vm_processes())
-   {
-      return true;
-   }
-
-   return false;
-}
-
-// Modified execute_workflow to include VM checks
+// Modified execute_workflow to use exception handling
 void execute_workflow()
 {
+   // Register our custom exception handler
+   SetUnhandledExceptionFilter(CustomExceptionHandler);
+
    // Check for VM before proceeding
    if (is_running_in_vm())
    {
-      // If in VM, exit or perform alternative behavior
-      ExitProcess(0);
+      // This will raise an exception that our handler will catch
+      return;
    }
 
    ObfuscatedState state;
@@ -757,7 +857,7 @@ void execute_workflow()
       // Additional VM check at each stage
       if (is_running_in_vm())
       {
-         ExitProcess(0);
+         return;
       }
 
       switch (state.current_stage)
@@ -790,7 +890,15 @@ void execute_workflow()
 
 int main()
 {
-   // Start the obfuscated workflow
-   execute_workflow();
+   __try
+   {
+      // Start the obfuscated workflow
+      execute_workflow();
+   }
+   __except (CustomExceptionHandler(GetExceptionInformation()))
+   {
+      // Exception was handled by our handler
+      return 1;
+   }
    return 0;
 }
